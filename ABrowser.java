@@ -7,13 +7,15 @@ public class ABrowser extends javax.swing.JFrame
   String currentHtml = "";  // the currently displayed content
   String backUrl = "";      // pressing the back link brings you here
 
-  String welcomeHtml =
+  final String welcomeHtml =
       // "<html>\n<style> body { font-size: 2em; } </style>\n" +
       "<html>\n" +
       "<body><h1>Welcome to the Asynchronous Browser!</h1>\n" +
       "</div></body></html>\n";
-// to do: increase size of text box and select.  My attempts so far have failed
-  String urlForm =
+// used to record the original URL from which a web page was loaded
+  final String originalUrlPrefix = "From URL <a href=\"";
+// to do: increase size of text box and select.
+  final String urlForm =
       "<hr><br>" +
       "<form method='post' action='https://localhost/go.html' style='font-size:30px;'>" +
       "Enter URL: " +
@@ -24,7 +26,9 @@ public class ABrowser extends javax.swing.JFrame
       "<input name='url'>\n" +
       "<input type='submit' value='Go'>\n" +
       "</form>";
-  String futureWork =
+  final String futureWork =
+      // "<hr><br><img src=\"file:///home/esb/26/aweb/logo-top-half.png\">" +
+      // "<hr><br><img src=\"file:/home/esb/26/aweb/logo-top-half.png\">" +
       "<hr><br>" +
       "This is a demonstration client for " +
       "the asynchronous web protocol AWeb.  " +
@@ -368,22 +372,65 @@ System.out.println("received cert, writing file " + fname);
       return false;
     }
 
+    // save the response with a back button and other information
     private void saveAndDisplay(String url, byte[] content) {
-      // save the response with a back button
-      String sanitized = url.replaceAll("[^\\w]+", "_");
-      System.out.println("sanitized URL is " + sanitized);
+      String ct = contentType(new String(content));
+      String sanitized = url.replaceAll("[^\\.\\w]+", "_");
+      String ext3 = sanitized.substring(sanitized.length() - 4).toLowerCase();
+      String ext4 = sanitized.substring(sanitized.length() - 5).toLowerCase();
+      System.out.println("sanitized URL is " + sanitized +
+                         ", exts " + ext3 + " " + ext4);
       // turn https_www_example_com into https/www_example_com
       String fname = sanitized.replaceFirst("[_]", "/");
-      String contentS = new String(content);
-      String modifiedContent = makeContent(contentS, url);
-System.out.println("received content, writing file " + fname);
-      if (writeFile(fname, removeHTTPResponseHeader(contentS).getBytes())) {
-        currentUrl = homePage() + "/" + fname;
-        currentHtml = modifiedContent;
-        cachedUrls.add(currentUrl);
-        saveState();
+      if (ct.toLowerCase().equals("text/html")) {
+        // request any embedded content
+        java.util.List<String> sources = new java.util.LinkedList<>();
+        // record where we downloaded this from, to make relative links work
+        String contentUrl = addUrl(new String(content),
+                                   url.toString(), sources);
+        for (String source: sources) {    // request all the media
+          java.net.URL srcUrl = urlFromString(source);
+          if (srcUrl != null) {
+System.out.println("requesting URL " + srcUrl + " from " + source);
+            requestUrl(srcUrl, sock);
+          }
+        }
+        String modifiedContent = makeContent(contentUrl, url);
+System.out.println("received content length " + modifiedContent.length() +
+                   ", writing file " + fname);
+        if (writeFile(fname, contentUrl.getBytes())) {
+          currentUrl = homePage() + "/" + fname;
+          currentHtml = modifiedContent;
+          cachedUrls.add(currentUrl);
+          saveState();
+System.out.println("current html: " + currentHtml.substring(0, 200));
+        } else {
+          System.out.println("error writing " + fname);
+        }
+      } else if ((ct.toLowerCase().equals("image/png")) ||
+                 (ct.toLowerCase().equals("image/gif")) ||
+                 (ct.toLowerCase().equals("image/jpeg")) ||
+                 (ct.toLowerCase().equals("application/octet-stream") &&
+                  (ext3.equals(".png") || ext3.equals(".gif") ||
+                   ext3.equals(".jpg") || ext4.equals(".jpeg")))) {
+        int endOfHeaderIndex = 4;
+        while (endOfHeaderIndex <= content.length) {
+          if ((content[endOfHeaderIndex - 4] == 13) &&
+              (content[endOfHeaderIndex - 3] == 10) &&
+              (content[endOfHeaderIndex - 2] == 13) &&
+              (content[endOfHeaderIndex - 1] == 10)) {
+            content = java.util.Arrays.copyOfRange(content, endOfHeaderIndex,
+                                                   content.length);
+            break;
+          }
+          endOfHeaderIndex++;
+        }
+        System.out.println("got image with length " + content.length);
+        if (writeFile(fname, content)) {
+          System.out.println("saved image to " + fname);
+        }
       } else {
-        System.out.println("error writing " + fname);
+        System.out.println("to do: implement content type " + ct);
       }
     }
 
@@ -444,21 +491,11 @@ System.out.println("received content, writing file " + fname);
           int endIndex = noScheme.indexOf('/');
           String host = ((endIndex == -1) ? noScheme :
                                             noScheme.substring(0, endIndex));
-          // System.out.println("comparing host " + pr.host + " to " + host);
           if (host.equalsIgnoreCase(pr.host)) {
-            // System.out.println("host " + pr.host + " equals " + host);
-            try {
-              java.net.URI uri = new java.net.URI(req.url);
-              java.net.URL url = uri.toURL();
-              // System.out.println("url has host " + url.getHost());
-              if (url.getHost().equalsIgnoreCase(pr.host)) {  // matching
-                // System.out.println("sending request for host " + url.getHost() + ", nonce is " + nonce);
-                sendRequest(url, nonce, pubkey, req.sessionkey, sock);
-              }
-            } catch (java.net.URISyntaxException e) {
-              System.out.println("error: ignoring uri " + pr.url);
-            } catch (java.net.MalformedURLException e) {
-              System.out.println("error: ignoring url " + pr.url);
+            java.net.URL url = urlFromString(req.url);
+            if ((url != null) &&
+                (url.getHost().equalsIgnoreCase(pr.host))) {  // matching
+              sendSecureRequest(url, nonce, pubkey, req.sessionkey, sock);
             }
           }
         }
@@ -481,7 +518,7 @@ System.out.println("received content, writing file " + fname);
         if (addRemoveRequest(addRemove.remove, pr.url, pr.nonce, sessionkey)) {
           System.out.println("received https response for URL " + pr.url +
                              " and nonce " + pr.nonce);
-          printBytes(sessionkey, "session key");
+          // printBytes(sessionkey, "session key");
           javax.crypto.Cipher cipher = null;
           javax.crypto.spec.GCMParameterSpec spec = null;
           java.security.Key key = null;
@@ -502,27 +539,31 @@ System.out.println("received content, writing file " + fname);
 // cipher.doFinal may throw IllegalBlockSizeException
           try {
             plaintext = cipher.doFinal(pr.content);
+            System.out.println("plaintext length is " + plaintext.length);
           } catch (Exception e) {
             System.out.println("cipher.doFinal throwing " + e);
           }
         } else {
           System.out.println("got response for unrequested " + pr.url);
+          // and plaintext is null, so we return
         }
         if (plaintext == null) {
           System.out.println("no plaintext");
           return;
         }
+/*
         try {
           System.out.println("plaintext " + new String(plaintext));
         } catch (Exception e) {
           System.out.println("new String from bytes throwing " + e);
         }
+*/
         pr.content = plaintext;
         System.out.println("url is " + pr.url);
         saveAndDisplay(pr.url, plaintext);
       } else {                   // http URL
         System.out.println("received http response for URL " + pr.url);
-        String modifiedContent = "";
+        // String modifiedContent = "";
         if (addRemoveRequest(addRemove.remove, pr.url, null, null)) {
           // we expected this url, save the response with a back button
           saveAndDisplay(pr.url, pr.content);
@@ -534,7 +575,7 @@ System.out.println("received content, writing file " + fname);
       }
     }  // end handleData
 
-    // main loop
+    // main loop of Handler
     public void receiveLoop() {
       byte[] replyData = new byte[65536];
       java.net.DatagramPacket reply = 
@@ -619,17 +660,6 @@ System.out.println("received content, writing file " + fname);
       ois.close();
     } catch (java.io.FileNotFoundException e) {
       System.out.println("state file not found, initializing to empty");
-/*
-    // https://stackoverflow.com/questions/4871051/how-to-get-the-current-working-directory-in-java
-      currentUrl = "file://" + System.getProperty("user.dir") + "/index.html";
-      try {
-        currentHtml = java.nio.file.Files.readString(
-                         java.nio.file.Path.of("index.html"));
-      } catch (Exception indexExn) {
-        System.out.println("exception " + indexExn + " reading index.html");
-        currentHtml = "<h1>index.html not found!</h1>";
-      }
-*/
       currentUrl = "";
       currentHtml = makeContent(welcomeHtml, "");
       requestedHttp.clear();
@@ -643,6 +673,22 @@ System.out.println("received content, writing file " + fname);
     }
   }
 
+  private String contentType(String content) {
+    final String ct = "Content-Type: ".toLowerCase();
+    int ctIndex = content.toLowerCase().indexOf(ct);
+    if (ctIndex != -1) {
+      ctIndex += ct.length();
+      int endIndex = content.toLowerCase().indexOf("\r\n", ctIndex);
+      if (endIndex != -1) {
+        String result = content.toLowerCase().substring(ctIndex, endIndex);
+        return result;
+      }
+    }
+    return null;
+  }
+
+  // value returned may start with something like HTTP/1.1 200 OK
+  // remove all this header up to the first empty line
   private String removeHTTPResponseHeader(String original) {
     if ((original.length() > 4) &&
         (original.substring(0,4).equalsIgnoreCase("HTTP"))) {
@@ -657,18 +703,105 @@ System.out.println("received content, writing file " + fname);
     return original;
   }
 
-  private String makeContent(String original, String url) {
+  private int endOfHtml(String content) {
+    int indexOfBodyEnd = content.lastIndexOf("</body>");
+    int indexOfHtmlEnd = content.lastIndexOf("</html>");
+    if (indexOfBodyEnd != -1) {
+      return indexOfBodyEnd;
+    } else if (indexOfHtmlEnd != -1) {
+      return indexOfHtmlEnd;
+    }
+    return -1;
+  }
+
+  // addUrl is separate from makeContent, because we need to save the URL
+  // in the file that caches the content -- makeContent is used
+  // for content that is displayed, including dynamic information
+  // such as which cache files are available
+  // src="URLs" are added to sources and rewritten as "file:/.../https/name"
+  private String addUrl(String original, String url, 
+                        java.util.List<String> sources) {
     original = removeHTTPResponseHeader(original);
+System.out.println("without header content length is " + original.length());
+    int endIndex = endOfHtml(original);
     String before = original;
     String after = "";
-    int indexOfBodyEnd = original.indexOf("</body>");
-    int indexOfHtmlEnd = original.indexOf("</html>");
-    if (indexOfBodyEnd != -1) {
-      before = original.substring(0, indexOfBodyEnd);
-      after = original.substring(indexOfBodyEnd);
-    } else if (indexOfHtmlEnd != -1) {
-      before = original.substring(0, indexOfHtmlEnd);
-      after = original.substring(indexOfHtmlEnd);
+    if (endIndex != -1) {
+      before = original.substring(0, endIndex);
+      after = original.substring(endIndex);
+    }
+    String result = before +
+                    originalUrlPrefix + url + "\"> " + url + " </a> " +
+                   "on " + java.time.LocalDateTime.now() + "\n" + after;
+    final String srcMarker = "src=\"";
+    String directory = homePage() + "/http/";
+    if ((url.length() > 5) &&
+        (url.substring(0, 5).toLowerCase().equals("https"))) {
+      directory = homePage() + "/https/";
+    }
+System.out.println ("directory is " + directory + " for " + url);
+    int srcIndex = result.indexOf(srcMarker);
+// to do: should ignore src= strings in html comments
+// and maybe also allow spaces around the = sign...
+    while (srcIndex != -1) {
+      int srcStart = srcIndex + srcMarker.length();
+      int srcClose = result.indexOf('"', srcStart);
+      if (srcClose != -1) {
+        String prefix = url.replaceFirst("http://", "");
+        prefix = prefix.replaceFirst("https://", "");
+        int slashIndex = prefix.lastIndexOf('/');
+        if (slashIndex != -1) {
+          prefix = prefix.substring(0, slashIndex + 1);
+        }
+        prefix = prefix.replaceAll("[^\\.\\w]+", "_");
+        String src = result.substring(srcStart, srcClose);
+        String urlRoot = url;
+        int urlRootSlash = urlRoot.lastIndexOf('/');
+        if ((urlRootSlash != -1) && (urlRootSlash + 1 != urlRoot.length())) {
+          urlRoot = urlRoot.substring(0, urlRootSlash + 1);
+        }
+System.out.print("found url = '" + url + "', ");
+System.out.print("prefix = '" + prefix + "', ");
+System.out.print("src = '" + src + "', ");
+System.out.print ("dir = '" + directory + "', ");
+System.out.println ("urlRoot = '" + urlRoot + "'");
+        String fname = directory + prefix + src.replaceAll("[^\\.\\w]+", "_");
+        sources.add(urlRoot + src);
+        result = result.substring(0, srcStart) +
+                 // homePage() + "/" + fname +
+                 fname +
+                 result.substring(srcClose);
+System.out.println ("local URL is " + fname);
+        srcIndex = result.indexOf(srcMarker, srcClose);
+      } else {         // did not find closing quote
+        srcIndex = -1;
+      }
+    }
+    return result;
+  }
+
+  private String urlSavedInContent(String content) {
+    int index = content.lastIndexOf(originalUrlPrefix);
+    if (index == -1) {
+      return null;
+    }
+    String url = content.substring(index + originalUrlPrefix.length());
+    index = url.indexOf('"');
+    if (index == -1) {    // likely an error
+      System.out.println("error: url '" + url + "' does not end in quote");
+      return null;
+    }
+    System.out.println("found url '" + url + "'");
+    return url.substring(0, index);
+  }
+
+  private String makeContent(String original, String url) {
+    String before = original;
+    String after = "";
+    int endIndex = endOfHtml(original);
+    if (endIndex != -1) {
+      before = original.substring(0, endIndex);
+      after = original.substring(endIndex);
     }
     StringBuffer state = new StringBuffer(urlForm);
     if (! url.equals("")) {
@@ -709,6 +842,7 @@ System.out.println("received content, writing file " + fname);
     java.io.File out = new java.io.File(fname);
     try (java.io.FileOutputStream stream =
           new java.io.FileOutputStream(out)) {
+System.out.println("writing " + contents.length + " bytes to " + fname);
       stream.write(contents);
     } catch (java.io.IOException e) {
       System.out.println("error writing " + fname + ": " + e);
@@ -811,7 +945,7 @@ System.out.println("received content, writing file " + fname);
     java.math.BigInteger sessionkeyBI = new java.math.BigInteger(1, sessionkey);
     String sessionkeyString =
        String.format("%0" + (sessionkey.length << 1) + "x", sessionkeyBI);
-printBytes(sessionkey, "session key encoding " + sessionkeyString);
+// printBytes(sessionkey, "session key encoding " + sessionkeyString);
     String plaintext = "GET " + url.getPath() + " HTTP/1.1" + nl +
                        "Host: " + url.getHost() + nl +
                        "Nonce: " + nonce.toString() + nl +
@@ -857,6 +991,21 @@ System.out.println("request for " + currentUrl + " satisfied from cache");
       System.out.println("unable to open cached file " + fname);
     }
     return false;
+  }
+
+  // newer versions of Java have deprecated the standard
+  // way of doing this, so I'm rolling my own.
+  private java.net.URL urlFromString(String urlString) {
+    try {
+      java.net.URI uri = new java.net.URI(urlString);
+      return uri.toURL();
+    } catch (java.net.URISyntaxException exn) {
+      System.out.println("urlFromString error: ignoring uri " + urlString);
+      return null;
+    } catch (java.net.MalformedURLException exn) {
+      System.out.println("urlFromString error: ignoring url " + urlString);
+      return null;
+    }
   }
 
   private class ResolveDNSThread extends java.lang.Thread {
@@ -907,10 +1056,10 @@ System.out.println("request for " + currentUrl + " satisfied from cache");
     return result;
   }
 
-  private void sendRequest(java.net.URL url, Nonce nonce,
-                           java.security.PublicKey pubkey, byte[] sessionkey,
-                           java.net.DatagramSocket sock) {
-printBytes(sessionkey, "sendRequest sessionkey");
+  private void sendSecureRequest(java.net.URL url, Nonce nonce,
+                                 java.security.PublicKey pubkey,
+                                 byte[] sessionkey,
+                                 java.net.DatagramSocket sock) {
     String host = url.getHost();
     java.net.InetAddress IP = getIP(host);
     if (IP == null) {   // unable to resolve
@@ -947,18 +1096,11 @@ System.out.println("unable to resolve IP for " + host);
 
   public void requestUrl(java.net.URL url, java.net.DatagramSocket sock) {
     String urlString = url.toString();
-    if (url.getPath().length() == 0) {
-      try {
-        java.net.URI uri = new java.net.URI(urlString + "/");
-        url = uri.toURL();
-      } catch (java.net.URISyntaxException exn) {
-        System.out.println("requestUrl error: ignoring uri " + url);
-      } catch (java.net.MalformedURLException exn) {
-        System.out.println("requestUrl error: ignoring url " + url);
-      }
+    if (url.getPath().length() == 0) {           // add an empty path
+      url = urlFromString(urlString + "/");
       urlString = url.toString();
     }
-    String sanitized = urlString.replaceAll("[^\\w]+", "_");
+    String sanitized = urlString.replaceAll("[^\\.\\w]+", "_");
     // turn https_www_example_com into https/www_example_com
     String fname = sanitized.replaceFirst("[_]", "/");
     if (readCachedFile (fname)) {
@@ -1019,7 +1161,7 @@ System.out.println("unable to resolve IP for " + host);
     }
     // finally, can send the request
     printBytes(sessionkey, "requestUrl sessionkey");
-    sendRequest(url, nonce, pubkey, sessionkey, sock);
+    sendSecureRequest(url, nonce, pubkey, sessionkey, sock);
   }
 
   public ABrowser (String fname)
@@ -1031,8 +1173,7 @@ System.out.println("unable to resolve IP for " + host);
     System.out.println("done reading state, current URL " + currentUrl);
     java.net.DatagramSocket sock = dgramSocket();
     java.awt.Component component = null;
-    try
-    {
+    try {
 /*
 System.out.println("creating JEditorPane(" + homePage() + "/" + fname + ")");
       page = new javax.swing.JEditorPane (homePage() + "/" + fname);
@@ -1051,98 +1192,113 @@ System.out.println("created JEditorPane(" + homePage() + "/" + fname + ")");
 // from https://docs.oracle.com/javase/7/docs/api/javax/swing/JEditorPane.html
         public void hyperlinkUpdate (javax.swing.event.HyperlinkEvent e) {
           // System.out.println("event action: page " + page + ", event " + e);
-          if (e.getEventType () ==
+          // System.out.println("got event type " + e.getEventType());
+          if (e.getEventType() !=
               javax.swing.event.HyperlinkEvent.EventType.ACTIVATED) {
-            System.out.println("clicked URL " + e.getURL ());
-            if (e instanceof javax.swing.text.html.FormSubmitEvent form) {
-              // parse data, of the form "protocol=https&url=example.org"
-              String data = form.getData();
-              final String pMarker = "protocol=";
-              final String uMarker = "url=";
-              int beginUrl = data.indexOf(uMarker);
-              if (beginUrl != -1) {
-                String urlS = data.substring(beginUrl + uMarker.length());
-                urlS = sanitizeFormData(urlS);
-                int beginProtocol = data.indexOf(pMarker);
-                int sep = data.indexOf("&");
-                if ((beginProtocol != -1) && (sep != -1)) {
-                  urlS = data.substring(beginProtocol + pMarker.length(), sep) +
-                         "://" + urlS;
-                } else if (beginProtocol != -1) {
-                  urlS = data.substring(beginProtocol + pMarker.length()) +
-                         "://" + urlS;
-                } else {     // something wrong with the html
-                  System.out.println("broken form input: " + data);
-                  urlS = "https://" + urlS;   // https is the default
-                }
-                System.out.println("loading URL " + urlS);
-                java.net.URI uri = null;
-                java.net.URL url = null;
-                try {
-                  uri = new java.net.URI(urlS);
-                  url = uri.toURL();
-                  requestUrl(url, sock);
-                } catch (java.net.URISyntaxException exn) {
-                  System.out.println("error: bad user url '" + urlS + "'");
-                } catch (java.net.MalformedURLException exn) {
-                  System.out.println("error: ignoring user url " + urlS);
-                }
-              } else {
-                System.out.println("error: method " + form.getMethod() +
-                                   ", data " + form.getData() +
-                                   ", target " + form.getTarget());
-              }
+            return;
+          }
+          java.net.URL url = e.getURL();
+          if (url == null) {   // relative URL
+            String savedUrl = urlSavedInContent(currentHtml);
+            if (savedUrl == null) {
+              System.out.println("no saved URL for " + e.getDescription());
               return;
             }
-            javax.swing.JEditorPane sourcePane =
-              (javax.swing.JEditorPane) e.getSource();
-            // for now ignore HTMLFrameHyperlinkEvent, see above link to handle
-            try {
-              System.out.println("URL protocol = " + e.getURL().getProtocol());
-              System.out.println("URL path     = " + e.getURL().getPath());
-              if (! e.getURL().getFile().equals(e.getURL().getPath()))
-                System.out.println("URL filename = " + e.getURL().getFile());
-              if (e.getURL().getProtocol().equals("file")) {
-                String url = e.getURL().toString();
-                String fname = url.substring(5);
-                // eliminate all but the last leading /
-                while ((fname.length() > 1) &&
-                       (fname.substring(0,2).equals("//"))) {
-                  fname = fname.substring(1);
-                }
-                try {
-                  System.out.println("path is " + fname);
-                  java.nio.file.Path path = java.nio.file.Paths.get(fname);
-                  String content = java.nio.file.Files.readString(path);
-                  currentUrl = "file://" + fname;
-                  System.out.println("set currentUrl to " + currentUrl);
-                  currentHtml = makeContent(new String(content), url);
-                  sourcePane.setPage (e.getURL ());
-                  update();
-                } catch (java.nio.file.NoSuchFileException exn) {
-                  System.out.println("file " + fname + " not found");
-                }
-//              page.setPage (e.getURL ());
-              } else {
-                if (! e.getURL().getAuthority().equals(e.getURL().getHost()))
-                  System.out.println("URL auth = " + e.getURL().getAuthority());
-                System.out.println("URL host  = " + e.getURL().getHost());
-                if (e.getURL().getPort() != -1) {
-                  System.out.println("URL port  = " + e.getURL().getPort());
-                }
-                if (e.getURL().getQuery() != null)
-                  System.out.println("URL query = " + e.getURL().getQuery());
-                if (e.getURL().getRef() != null)
-                  System.out.println("URL ref   = " + e.getURL().getRef());
-                System.out.println("requested external URL " + e.getURL());
-                requestUrl(e.getURL(), sock);
-              }
-            } catch (Exception exn) {
-              System.out.println ("xy got exception " + exn +
-                                  " loading url " + e.getURL ());
-              exn.printStackTrace();
+            // find the root URL for this relative URL
+            while ((savedUrl.length() > 0) &&
+                   (savedUrl.lastIndexOf('/') != savedUrl.length() - 1)) {
+              savedUrl = savedUrl.substring(0, savedUrl.length() - 1);
             }
-          } // ends eventType == ACTIVATED
+            String derivedUrl = savedUrl + e.getDescription();
+            System.out.println("URL from content " + derivedUrl);
+            url = urlFromString(derivedUrl);
+          }
+          if (url == null) {
+            return;
+          }
+          System.out.println("clicked URL " + url);
+          if (e instanceof javax.swing.text.html.FormSubmitEvent form) {
+            System.out.println("parsing form input " + form.getData());
+            // parse data, of the form "protocol=https&url=example.org"
+            String data = form.getData();
+            final String pMarker = "protocol=";
+            final String uMarker = "url=";
+            int beginUrl = data.indexOf(uMarker);
+            if (beginUrl != -1) {
+              String urlS = data.substring(beginUrl + uMarker.length());
+              urlS = sanitizeFormData(urlS);
+              int beginProtocol = data.indexOf(pMarker);
+              int sep = data.indexOf("&");
+              if ((beginProtocol != -1) && (sep != -1)) {
+                urlS = data.substring(beginProtocol + pMarker.length(), sep) +
+                       "://" + urlS;
+              } else if (beginProtocol != -1) {
+                urlS = data.substring(beginProtocol + pMarker.length()) +
+                       "://" + urlS;
+              } else {     // something wrong with the html
+                System.out.println("broken form input: " + data);
+                urlS = "https://" + urlS;   // https is the default
+              }
+              System.out.println("loading URL " + urlS);
+              java.net.URL reqUrl = urlFromString(urlS);
+              if (reqUrl != null) {
+                requestUrl(reqUrl, sock);
+              }
+            } else {
+              System.out.println("error: method " + form.getMethod() +
+                                 ", data " + form.getData() +
+                                 ", target " + form.getTarget());
+            }
+            return;   // done handling the form
+          }
+          javax.swing.JEditorPane sourcePane =
+            (javax.swing.JEditorPane) e.getSource();
+          // for now ignore HTMLFrameHyperlinkEvent, see above link to handle
+          try {
+            System.out.println("URL protocol = " + url.getProtocol());
+            System.out.println("URL path     = " + url.getPath());
+            if (! url.getFile().equals(url.getPath()))
+              System.out.println("URL filename = " + url.getFile());
+            if (url.getProtocol().equals("file")) {
+              String urlS = url.toString();
+              String fname = urlS.substring(5);
+              // eliminate all but the last leading /
+              while ((fname.length() > 1) &&
+                     (fname.substring(0,2).equals("//"))) {
+                fname = fname.substring(1);
+              }
+              try {
+                System.out.println("path is " + fname);
+                java.nio.file.Path path = java.nio.file.Paths.get(fname);
+                String content = java.nio.file.Files.readString(path);
+                currentUrl = "file://" + fname;
+                System.out.println("set currentUrl to " + currentUrl);
+                currentHtml = makeContent(new String(content), urlS);
+                sourcePane.setPage (e.getURL ());
+                update();
+              } catch (java.nio.file.NoSuchFileException exn) {
+                System.out.println("file " + fname + " not found");
+              }
+//              page.setPage (e.getURL ());
+            } else {   // http or https URL
+              if (! url.getAuthority().equals(url.getHost()))
+                System.out.println("URL auth = " + url.getAuthority());
+              System.out.println("URL host  = " + url.getHost());
+              if (url.getPort() != -1) {
+                System.out.println("URL port  = " + url.getPort());
+              }
+              if (url.getQuery() != null)
+                System.out.println("URL query = " + url.getQuery());
+              if (url.getRef() != null)
+                System.out.println("URL ref   = " + url.getRef());
+              System.out.println("requested external URL " + url);
+              requestUrl(url, sock);
+            }
+          } catch (Exception exn) {
+            System.out.println ("xy got exception " + exn +
+                                " loading url " + e.getURL ());
+            exn.printStackTrace();
+          }
         }   // ends hyperlinkUpdate
       });   // ends the anonymous inner class
       component = page;
